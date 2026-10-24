@@ -1,0 +1,41 @@
+{
+    "enabled": {
+        "description": "启用唱歌功能",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后指令和自然语言都不会发送歌曲。"
+    },
+    "send_mode": {
+        "description": "发送方式",
+        "type": "string",
+        "options": [
+            "file",
+            "record"
+        ],
+        "default": "file",
+        "hint": "file：发送 MP3 文件，适合 3–5 分钟完整歌曲；record：发送语音消息，QQ 对长语音限制很严，可能失败。"
+    },
+    "mp3_bitrate": {
+        "description": "MP3 码率",
+        "type": "string",
+        "options": [
+            "128k",
+            "192k",
+            "320k"
+        ],
+        "default": "192k",
+        "hint": "码率越高文件越大；320k 转换更慢。"
+    },
+    "avoid_repeat": {
+        "description": "避免连续重复",
+        "type": "bool",
+        "default": true,
+        "hint": "同一个会话连续点歌时，尽量不选上一首。"
+    },
+    "cooldown_seconds": {
+        "description": "点歌冷却（秒）",
+        "type": "int",
+        "default": 0,
+        "hint": "填 0 表示不限制；大于 0 时同一会话在这个时间内只能点一次。"
+    }
+}
