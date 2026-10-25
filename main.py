@@ -1,15 +1,18 @@
-"""Randomly send one of Luna's bundled songs.
+"""让 Luna 唱歌：随机选一首，或者按用户点名的曲子发对应文件。
 
-Songs are stored as WAV files inside ``songs/``.  On first use a song is
-transcoded to MP3 for delivery; WAV originals stay untouched.
+歌曲以 WAV/MP3 等音频文件放在 ``songs/`` 目录，首次发送时转码成 MP3 缓存到
+``cache/``，原始文件不动。用户点名但曲库里没有时，按人格设定回一句，而不是
+硬塞一首随机歌。
 """
 
 from __future__ import annotations
 
 import asyncio
+import difflib
 import random
 import re
 import time
+import unicodedata
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -32,6 +35,39 @@ _SING_RE = re.compile(
 )
 _NEGATIVE_RE = re.compile(r"(?:别|不要|不用|停止|闭嘴).{0,4}(?:唱|歌)")
 
+# 点歌时要去掉的动词/语气词，长的写在前面，避免只吃掉一半
+_FILLER_RE = re.compile(
+    r"(?i)(?:"
+    r"给我唱|唱给我听|唱一首|唱一个|唱一段|唱首|唱唱|唱|"
+    r"来一首|来一个|来首|来点|来|"
+    r"放一首|放首|放|点一首|点首|点歌|点|"
+    r"听一首|听首|听听看|听听|听|整一首|整首|整|"
+    r"我可以|可不可以|能不能|可以|能否|能|"
+    r"帮我|给我|替我|为你|为你唱|"
+    r"我想要|我想|我要|想听|想|"
+    r"请|麻烦|拜托|"
+    r"一首|一曲|一支|一个|首|曲|歌|歌曲|音乐|"
+    r"这首歌|那首歌|这个|那个|这|那|的|"
+    r"你的|你|露娜|luna|"
+    r"好吗|好不好|行吗|行不行|吧|呗|呀|啊|嘛|哦|啦|呢|了|"
+    r"一下|一遍|"
+    r"日语|日文|中文|英文|国语|粤语|二次元|动漫|acg"
+    r")"
+)
+_GENERIC_RE = re.compile(
+    r"^(?:好听|随便|都行|都|任意|你决定|你来选|你选|喜欢|最爱|你的|"
+    r"来|点|唱|吧|的|歌|曲|音乐)+$"
+)
+_PUNCT_RE = re.compile(r"[\s\u3000!-/:-@\[-`{-~。、，．·…〜~！？「」『』【】（）()《》〈〉「」『』—–_]+")
+
+# 点不到歌时的回应（{title} 是用户点的名字，{songs} 是现有曲目）
+_MISS_LINES = (
+    "「{title}」？曲库里没有这首。……换一首，还是打算就这样空着手回去？",
+    "没有。你倒是会挑，可惜我没录过。想听什么，说清楚一点。",
+    "……不在曲库。我的时间不便宜，想听就自己挑一首有的。",
+    "这首我没有。别露出那种表情——把歌名换成清单上的，我可以考虑。",
+)
+
 
 class SingError(RuntimeError):
     """Raised when a song cannot be prepared for delivery."""
@@ -44,8 +80,81 @@ class _AddressedFilter(filter.CustomFilter):
         return event.is_private_chat() or event.is_at_or_wake_command
 
 
+def _normalize(text: str) -> str:
+    """把文本压成只含字母/假名/汉字的小写形式，便于比较。"""
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return re.sub(r"[^0-9a-z\u3040-\u30ff\u4e00-\u9fff]+", "", folded)
+
+
+def _ratio(left: str, right: str) -> float:
+    return difflib.SequenceMatcher(None, left, right).ratio()
+
+
+def _partial_ratio(left: str, right: str) -> float:
+    """短串在长串上滑窗取最高相似度，抵消前缀废话（“唱一首…”）的影响。"""
+    if not left or not right:
+        return 0.0
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    best = _ratio(short, long)
+    for index in range(len(long) - len(short) + 1):
+        best = max(best, _ratio(short, long[index : index + len(short)]))
+    return best
+
+
+def _title_of(song: Path) -> str:
+    title = _TRACK_PREFIX_RE.sub("", song.stem).strip()
+    return title or song.stem
+
+
+def _match_song(request: str, songs: list[Path]) -> tuple[Path, float] | None:
+    """在曲库里找最匹配的一首，返回 (歌曲, 置信度)；不够像就返回 None。"""
+    query = _normalize(request)
+    if not query:
+        return None
+    best_song: Path | None = None
+    best_score = 0.0
+    for song in songs:
+        title = _normalize(_title_of(song))
+        if not title:
+            continue
+        if query == title:
+            score = 1.0
+        elif title in query:
+            score = 0.95
+        elif query in title and len(query) >= 3:
+            score = 0.9
+        else:
+            score = _partial_ratio(query, title) * 0.95
+        if score > best_score:
+            best_song, best_score = song, score
+    if best_song is not None and best_score >= 0.72:
+        return best_song, best_score
+    return None
+
+
+def _requested_title(text: str) -> str:
+    """从一句话里剥出用户点的歌名；只是泛泛想听歌时返回空串。"""
+    stripped = _FILLER_RE.sub(" ", text)
+    stripped = _PUNCT_RE.sub(" ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    if len(_normalize(stripped)) < 2:
+        return ""
+    if _GENERIC_RE.match(_normalize(stripped)):
+        return ""
+    return stripped
+
+
+def _strip_command(text: str) -> str:
+    """去掉指令前缀（“/唱歌”“唱歌”“sing”等），只留参数。"""
+    stripped = re.sub(r"^[/／!！]\s*", "", text.strip())
+    for name in ("唱一首", "唱歌", "来首歌", "sing"):
+        if stripped.lower().startswith(name.lower()):
+            return stripped[len(name) :].strip()
+    return stripped
+
+
 class LunaSingPlugin(Star):
-    """Let users ask Luna to sing a random bundled song."""
+    """Let users ask Luna to sing a random song or a specific one."""
 
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -64,6 +173,8 @@ class LunaSingPlugin(Star):
             0.0,
             120.0,
         )
+        self.miss_reply = str(config.get("miss_reply", "") or "").strip()
+        self.list_on_miss = self._as_bool(config.get("list_songs_on_miss", True))
 
         root = Path(__file__).resolve().parent
         self._songs_dir = root / "songs"
@@ -110,19 +221,39 @@ class LunaSingPlugin(Star):
             raise SingError(f"读取歌曲目录失败：{exc}") from exc
         return sorted(songs, key=lambda item: item.name.casefold())
 
-    def _pick_song(self, session: str) -> Path:
-        songs = self._songs()
+    def _pick_song(self, session: str, songs: list[Path]) -> Path:
         if not songs:
             raise SingError("歌曲目录里没有可用的音频文件")
         last = self._last_song.get(session)
         if self.avoid_repeat and len(songs) > 1:
-            songs = [song for song in songs if song.name != last] or songs
-        return random.choice(songs)
+            candidates = [song for song in songs if song.name != last] or songs
+        else:
+            candidates = songs
+        return random.choice(candidates)
+
+    def _available_titles(self, songs: list[Path]) -> str:
+        return "、".join(_title_of(song) for song in songs)
+
+    def _miss_message(self, request: str, songs: list[Path]) -> str:
+        title = request or "这首"
+        catalog = self._available_titles(songs)
+        if self.miss_reply:
+            text = self.miss_reply.replace("{title}", title).replace("{songs}", catalog)
+            if "{songs}" in self.miss_reply:
+                return text
+        else:
+            text = random.choice(_MISS_LINES).replace("{title}", title)
+        if self.list_on_miss and catalog:
+            text = f"{text}\n{random.choice(self._catalog_prefixes())}{catalog}。"
+        return text
 
     @staticmethod
-    def _title(song: Path) -> str:
-        title = _TRACK_PREFIX_RE.sub("", song.stem).strip()
-        return title or song.stem
+    def _catalog_prefixes() -> tuple[str, ...]:
+        return (
+            "现在曲库里只有：",
+            "手头这些，自己挑：",
+            "曲库就这些：",
+        )
 
     async def _safe_send(self, event: AstrMessageEvent, text: str) -> None:
         try:
@@ -230,7 +361,11 @@ class LunaSingPlugin(Star):
             part.replace(output)
             return output
 
-    async def _serve(self, event: AstrMessageEvent) -> AsyncIterator[MessageEventResult]:
+    async def _serve(
+        self,
+        event: AstrMessageEvent,
+        text: str = "",
+    ) -> AsyncIterator[MessageEventResult]:
         if not self.enabled:
             yield event.plain_result("唱歌功能暂时关闭了。")
             return
@@ -245,8 +380,20 @@ class LunaSingPlugin(Star):
                 return
 
         try:
-            song = self._pick_song(session)
-            title = self._title(song)
+            songs = self._songs()
+            requested = _requested_title(text) if text else ""
+            if requested:
+                matched = _match_song(requested, songs) or _match_song(text, songs)
+                if matched is None:
+                    yield event.plain_result(self._miss_message(requested, songs))
+                    return
+                song, score = matched
+                logger.debug(
+                    "[LunaSing] 点歌 %r -> %s (%.2f)", requested, song.name, score
+                )
+            else:
+                song = self._pick_song(session, songs)
+            title = _title_of(song)
             await self._safe_send(event, f"🎤 正在准备：{title}…")
             audio = await self._to_mp3(song)
         except SingError as exc:
@@ -262,9 +409,9 @@ class LunaSingPlugin(Star):
         self._last_time[session] = now
         size_mb = audio.stat().st_size / 1024 / 1024
         summary = (
-            "🎤 随机唱一首\n"
-            f"🎵 {title}\n"
-            f"📦 MP3 · {self.bitrate} · {size_mb:.1f} MB"
+            (f"🎤 就这首：{title}\n" if requested else "🎤 随机唱一首\n")
+            + f"🎵 {title}\n"
+            + f"📦 MP3 · {self.bitrate} · {size_mb:.1f} MB"
         )
         if self.send_mode == "record":
             component = Comp.Record.fromFileSystem(path=str(audio))
@@ -279,15 +426,15 @@ class LunaSingPlugin(Star):
 
     @filter.command("唱歌", alias={"唱一首", "sing", "来首歌"})
     async def sing_command(self, event: AstrMessageEvent):
-        """随机唱一首歌。"""
+        """唱歌；带上歌名就是点歌，例如“/唱歌 Desire”。"""
 
-        async for result in self._serve(event):
+        text = _strip_command(event.get_message_str())
+        async for result in self._serve(event, text):
             yield result
 
-    @filter.regex(_SING_RE, priority=100)
-    @filter.custom_filter(_AddressedFilter, priority=100)
+    @filter.custom_filter(_AddressedFilter)
     async def sing_natural_language(self, event: AstrMessageEvent):
-        """让用户用自然语言点歌，例如“唱首歌”“来首好听的”。"""
+        """自然语言点歌，例如“唱首 Desire”“来首好听的”。"""
 
         if not self.enabled:
             return
@@ -301,10 +448,21 @@ class LunaSingPlugin(Star):
         if not (event.is_private_chat() or event.is_at_or_wake_command):
             return
 
+        # 要么是“想听歌”这类泛请求，要么直接报了一首曲库里的歌名
+        requested = _requested_title(text)
+        try:
+            looks_like_song = bool(requested) and _match_song(
+                requested, self._songs()
+            ) is not None
+        except SingError:
+            return
+        if not _SING_RE.search(text) and not looks_like_song:
+            return
+
         # Yield the result before stopping the event, so the respond stage can
         # still deliver the audio/file component.
         try:
-            async for result in self._serve(event):
+            async for result in self._serve(event, text):
                 yield result
         finally:
             event.stop_event()

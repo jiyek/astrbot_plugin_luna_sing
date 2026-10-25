@@ -30,12 +30,24 @@
         "description": "避免连续重复",
         "type": "bool",
         "default": true,
-        "hint": "同一个会话连续点歌时，尽量不选上一首。"
+        "hint": "随机点歌时尽量不选上一首；指定歌名时不受此限制。"
     },
     "cooldown_seconds": {
         "description": "点歌冷却（秒）",
         "type": "int",
         "default": 0,
         "hint": "填 0 表示不限制；大于 0 时同一会话在这个时间内只能点一次。"
+    },
+    "miss_reply": {
+        "description": "点不到时的回复模板",
+        "type": "string",
+        "default": "",
+        "hint": "留空使用内置的人格化台词。可用 {title} 表示用户点的歌名，{songs} 表示现有曲目列表；模板里带上 {songs} 就不会再自动追加列表。"
+    },
+    "list_songs_on_miss": {
+        "description": "点不到时列出曲库",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后会在回复里附上现有曲目，方便用户改点。"
     }
 }
