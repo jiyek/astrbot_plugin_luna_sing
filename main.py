@@ -58,6 +58,8 @@ _GENERIC_RE = re.compile(
     r"^(?:好听|随便|都行|都|任意|你决定|你来选|你选|喜欢|最爱|你的|"
     r"来|点|唱|吧|的|歌|曲|音乐)+$"
 )
+# 剥出来的“歌名”里带这些字，多半是在聊天而不是点歌
+_CHATTY_RE = re.compile(r"(?:说|话|聊|讲|告诉|看看|睡|吃|玩|做|陪|夸|骂|叫)")
 _PUNCT_RE = re.compile(r"[\s\u3000!-/:-@\[-`{-~。、，．·…〜~！？「」『』【】（）()《》〈〉「」『』—–_]+")
 
 # 点不到歌时的回应（{title} 是用户点的名字，{songs} 是现有曲目）
@@ -451,12 +453,13 @@ class LunaSingPlugin(Star):
         # 要么是“想听歌”这类泛请求，要么直接报了一首曲库里的歌名
         requested = _requested_title(text)
         try:
-            looks_like_song = bool(requested) and _match_song(
-                requested, self._songs()
-            ) is not None
+            matched = _match_song(requested, self._songs()) if requested else None
         except SingError:
             return
-        if not _SING_RE.search(text) and not looks_like_song:
+        if requested and matched is None and _CHATTY_RE.search(requested):
+            # 例如“想听你说说话”：像聊天，不在插件里接，交给主线回答
+            return
+        if not _SING_RE.search(text) and matched is None:
             return
 
         # Yield the result before stopping the event, so the respond stage can
