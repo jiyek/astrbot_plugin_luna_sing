@@ -481,7 +481,7 @@ class LunaSingPlugin(Star):
         async for result in self._serve(event, text):
             yield result
 
-    @filter.custom_filter(_AddressedFilter)
+    @filter.custom_filter(_AddressedFilter, priority=100)
     async def sing_natural_language(self, event: AstrMessageEvent):
         """自然语言点歌，例如“唱首 Desire”“来首好听的”。"""
 
