@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import difflib
-import os
+import inspect
 import random
 import re
-import subprocess
-import sys
 import time
 import unicodedata
 from collections.abc import AsyncIterator
+from html import escape as _escape
 from pathlib import Path
+from urllib.parse import quote
 
 import astrbot.api.message_components as Comp
 import imageio_ffmpeg
@@ -254,42 +254,193 @@ class LunaSingPlugin(Star):
         self._register_open_folder_api()
 
     def _register_open_folder_api(self) -> None:
-        """注册看板接口：在服务器所在机器上打开曲库目录。"""
+        """注册看板接口：曲库管理页（查看目录、上传新歌）。"""
         try:
+            # 重载后旧实例注册的路由不会自动清掉，先按路由清一遍再注册，
+            # 否则 GET 会命中上一次重载留下的旧 handler。
+            apis = getattr(self.context, "registered_web_apis", None)
+            if isinstance(apis, list):
+                apis[:] = [entry for entry in apis if entry[0] != _OPEN_FOLDER_ROUTE]
             self.context.register_web_api(
                 _OPEN_FOLDER_ROUTE,
-                self._open_songs_folder,
-                ["GET"],
-                "打开 Luna 唱歌的曲库文件夹",
+                self._songs_page,
+                ["GET", "POST"],
+                "Luna 唱歌的曲库管理页",
             )
         except Exception as exc:  # noqa: BLE001 - 老版本 AstrBot 没有这个接口
-            logger.warning("[LunaSing] 注册「打开曲库目录」接口失败: %s", exc)
+            logger.warning("[LunaSing] 注册「曲库管理页」失败: %s", exc)
 
-    async def _open_songs_folder(self, **_: object) -> dict:
-        """在资源管理器里打开曲库目录（看板配置页的快捷入口）。"""
-        path = self._songs_dir
+    async def _songs_page(self, **_: object):
+        """曲库管理页：列出现有歌曲，并支持直接上传新歌。"""
         try:
-            path.mkdir(parents=True, exist_ok=True)
-            if os.name == "nt":
-                # 直接起 explorer 比 ShellExecute 更宽松：实例以低完整性运行，
-                # os.startfile 会被拒绝（WinError 5），CreateProcess 一般没问题。
-                subprocess.Popen(["explorer.exe", str(path)])
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(path)])
-            else:
-                subprocess.Popen(["xdg-open", str(path)])
-        except Exception as exc:  # noqa: BLE001 - 返回错误给看板
-            logger.warning("[LunaSing] 打开曲库目录失败: %s", exc)
-            return {
-                "status": "error",
-                "message": f"打开失败：{exc}",
-                "data": {"path": str(path)},
-            }
-        return {
-            "status": "ok",
-            "message": f"已打开：{path}",
-            "data": {"path": str(path)},
-        }
+            from quart import request  # 看板提供的 Quart 兼容层
+        except Exception:  # noqa: BLE001 - 没有兼容层就退化
+            return {"status": "error", "message": "当前 AstrBot 版本不支持曲库页面"}
+
+        try:
+            from starlette.responses import HTMLResponse, RedirectResponse
+        except Exception:  # noqa: BLE001
+            return {"status": "error", "message": "缺少 starlette 响应组件"}
+
+        if request.method == "POST":
+            saved, failed, error = await self._save_uploads(request)
+            query = f"?saved={saved}&failed={failed}"
+            if error:
+                query += f"&error={quote(error)}"
+            return RedirectResponse(f"{request.path}{query}", status_code=303)
+
+        return HTMLResponse(
+            self._render_songs_page(
+                saved=request.args.get("saved"),
+                failed=request.args.get("failed"),
+                error=request.args.get("error"),
+            ),
+        )
+
+    async def _save_uploads(self, request) -> tuple[int, int, str]:
+        """把上传的文件存进曲库目录，返回 (成功数, 失败数, 错误说明)。"""
+        saved = 0
+        failed = 0
+        error = ""
+        try:
+            uploads = await request.files
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[LunaSing] 读取上传内容失败: %s", exc)
+            return 0, 1, f"读取上传内容失败: {exc}"
+        for item in uploads.getlist("files"):
+            name = Path(str(getattr(item, "filename", "") or "")).name
+            suffix = Path(name).suffix.lower()
+            if not name or suffix not in _SUPPORTED_SUFFIXES:
+                logger.warning("[LunaSing] 跳过不支持的文件: %s", name or "<空>")
+                failed += 1
+                continue
+            try:
+                await self._save_stream(item, self._songs_dir / name)
+                saved += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[LunaSing] 保存 %s 失败: %s", name, exc)
+                failed += 1
+                error = f"{name}: {exc}"
+        if saved:
+            logger.info("[LunaSing] 已上传 %s 首歌到 %s", saved, self._songs_dir)
+        return saved, failed, error
+
+    @staticmethod
+    async def _save_stream(upload, destination: Path) -> None:
+        """把上传内容分块写到磁盘，兼容 Starlette UploadFile 和 quart FileStorage。"""
+        limit = 512 * 1024 * 1024
+        reader = getattr(upload, "read", None)
+        if reader is None:
+            raise ValueError("上传对象不可读")
+        seek = getattr(upload, "seek", None)
+        if seek is not None:
+            try:
+                result = seek(0)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # noqa: BLE001 - 不能 seek 就算了
+                pass
+        temp = destination.with_name(f"{destination.name}.uploading")
+        total = 0
+        try:
+            with temp.open("wb") as output:
+                while True:
+                    chunk = reader(1024 * 1024)
+                    if inspect.isawaitable(chunk):
+                        chunk = await chunk
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise ValueError("文件超过 512MB")
+                    output.write(chunk)
+            temp.replace(destination)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+
+    def _render_songs_page(
+        self,
+        saved: str | None = None,
+        failed: str | None = None,
+        error: str | None = None,
+    ) -> str:
+        """渲染曲库管理页的 HTML。"""
+        songs = self._songs()
+        total = 0
+        rows: list[str] = []
+        for song in songs:
+            try:
+                stat = song.stat()
+                size = stat.st_size
+                modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
+            except OSError:
+                size, modified = 0, "-"
+            total += size
+            rows.append(
+                "<tr><td>{}</td><td>{}</td><td>{:.1f} MB</td><td>{}</td></tr>".format(
+                    _escape(_title_of(song)),
+                    _escape(song.name),
+                    size / 1024 / 1024,
+                    modified,
+                ),
+            )
+
+        banner = ""
+        if saved and saved.isdigit() and int(saved) > 0:
+            banner += f'<p class="ok">已上传 {int(saved)} 首，立即可点。</p>'
+        if failed and failed.isdigit() and int(failed) > 0:
+            banner += f'<p class="warn">{int(failed)} 个文件被跳过（格式不支持或写入失败）。</p>'
+        if error:
+            banner += f'<p class="warn">{_escape(error)}</p>'
+
+        accept = ",".join(sorted(_SUPPORTED_SUFFIXES))
+        table = "\n".join(rows) or '<tr><td colspan="4" class="empty">曲库还是空的</td></tr>'
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luna 曲库</title>
+<style>
+  body {{ font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px;
+         background: #faf7f8; color: #2b2326; }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; }}
+  .sub {{ color: #7b6f74; font-size: 13px; margin-bottom: 18px; }}
+  code {{ background: #efe7ea; padding: 2px 6px; border-radius: 4px; font-size: 12px;
+          word-break: break-all; }}
+  .card {{ background: #fff; border: 1px solid #e8dfe3; border-radius: 10px; padding: 16px;
+           margin-bottom: 16px; }}
+  form {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
+  button {{ background: #b3305a; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px;
+            cursor: pointer; font-size: 14px; }}
+  button:hover {{ background: #992748; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th, td {{ text-align: left; padding: 7px 8px; border-bottom: 1px solid #f0e8eb; }}
+  th {{ color: #7b6f74; font-weight: 600; }}
+  .ok {{ color: #1b7f4b; }} .warn {{ color: #b3541e; }} .empty {{ color: #9a8f94; }}
+</style>
+</head>
+<body>
+  <h1>Luna 曲库</h1>
+  <p class="sub">{len(songs)} 首 · 共 {total / 1024 / 1024:.1f} MB · 目录 <code>{_escape(str(self._songs_dir))}</code></p>
+  {banner}
+  <div class="card">
+    <form method="post" enctype="multipart/form-data">
+      <input type="file" name="files" multiple accept="{accept}">
+      <button type="submit">上传到曲库</button>
+      <span class="sub">支持 {accept}</span>
+    </form>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>歌名</th><th>文件</th><th>大小</th><th>修改时间</th></tr></thead>
+      <tbody>{table}</tbody>
+    </table>
+  </div>
+  <p class="sub">也可以直接把音频文件复制到上面的目录，再回到这里刷新。</p>
+</body>
+</html>"""
 
     @staticmethod
     def _as_bool(value) -> bool:

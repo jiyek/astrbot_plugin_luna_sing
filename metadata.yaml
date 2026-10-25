@@ -1,7 +1,7 @@
 name: astrbot_plugin_luna_sing
 display_name: Luna 唱歌
 desc: 随机唱歌或按歌名点歌：曲库里有就发对应歌曲，没有时按人格设定回复。支持 /唱歌 指令和自然语言。
-version: v1.3.0
+version: v1.4.0
 author: Luna
 astrbot_version: ">=4.17.0"
 support_platforms:

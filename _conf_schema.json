@@ -9,7 +9,7 @@
         "description": "曲库目录",
         "type": "string",
         "default": "",
-        "hint": "留空就用插件目录下的 songs/；也可以填任意目录（支持绝对路径，例如 D:\\Music\\Luna）。<br><a href=\"/api/plug/astrbot_plugin_luna_sing/open-songs\" target=\"_blank\" rel=\"noopener\">📂 点这里打开曲库文件夹</a>"
+        "hint": "留空就用插件目录下的 songs/；也可以填任意目录（支持绝对路径，例如 D:\\Music\\Luna）。<br><a href=\"/api/plug/astrbot_plugin_luna_sing/open-songs\" target=\"_blank\" rel=\"noopener\">📂 打开曲库管理页（可查看 / 直接上传歌曲）</a>"
     },
     "send_mode": {
         "description": "发送方式",
