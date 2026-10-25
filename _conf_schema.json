@@ -42,12 +42,12 @@
         "description": "点不到时的回复模板",
         "type": "string",
         "default": "",
-        "hint": "留空使用内置的人格化台词。可用 {title} 表示用户点的歌名，{songs} 表示现有曲目列表；模板里带上 {songs} 就不会再自动追加列表。"
+        "hint": "留空使用内置的人格化台词。可用 {title} 表示用户点的歌名，{songs} 表示现有曲目列表（默认不列，想要才写）。"
     },
-    "list_songs_on_miss": {
-        "description": "点不到时列出曲库",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后会在回复里附上现有曲目，方便用户改点。"
+    "song_aliases": {
+        "description": "歌曲别名",
+        "type": "object",
+        "default": {},
+        "hint": "键是用户可能说的名字，值是曲目标题里的片段，例如 {\"蓝色夜曲\": \"青いあの日のセレナーデ\"}。内置了常用的中文译名，这里可以追加或覆盖。"
     }
 }

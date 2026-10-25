@@ -62,13 +62,30 @@ _GENERIC_RE = re.compile(
 _CHATTY_RE = re.compile(r"(?:说|话|聊|讲|告诉|看看|睡|吃|玩|做|陪|夸|骂|叫)")
 _PUNCT_RE = re.compile(r"[\s\u3000!-/:-@\[-`{-~。、，．·…〜~！？「」『』【】（）()《》〈〉「」『』—–_]+")
 
-# 点不到歌时的回应（{title} 是用户点的名字，{songs} 是现有曲目）
+# 点不到歌时的回应（{title} 是用户点的名字）
 _MISS_LINES = (
-    "「{title}」？曲库里没有这首。……换一首，还是打算就这样空着手回去？",
-    "没有。你倒是会挑，可惜我没录过。想听什么，说清楚一点。",
-    "……不在曲库。我的时间不便宜，想听就自己挑一首有的。",
-    "这首我没有。别露出那种表情——把歌名换成清单上的，我可以考虑。",
+    "「{title}」？曲库里没有这首。……换一首。",
+    "没有。你倒是会挑，可惜我没录过。",
+    "……不在曲库。想听的话，挑一首我有的。",
+    "这首我没有。把歌名换成我有的，再开口。",
 )
+
+# 日语歌的中文叫法；值只要能在曲目标题里命中就行（用户还可在配置里追加）
+_BUILTIN_ALIASES = {
+    "尽情绽放": "咲き誇れ今",
+    "如今尽情绽放": "咲き誇れ今",
+    "向着看不见的尽头": "果ての見えぬ先に",
+    "看不见的尽头": "果ての見えぬ先に",
+    "蓝色夜曲": "青いあの日のセレナーデ",
+    "蓝色的夜曲": "青いあの日のセレナーデ",
+    "那日蓝色的夜曲": "青いあの日のセレナーデ",
+    "纯真樱桃": "チェリブラピュア",
+    "樱桃纯真": "チェリブラピュア",
+    "纯真之樱": "チェリブラピュア",
+    "悠久交响曲": "悠久のシンフォニー",
+    "永恒交响曲": "悠久のシンフォニー",
+    "悠久交响乐": "悠久のシンフォニー",
+}
 
 
 class SingError(RuntimeError):
@@ -108,7 +125,34 @@ def _title_of(song: Path) -> str:
     return title or song.stem
 
 
-def _match_song(request: str, songs: list[Path]) -> tuple[Path, float] | None:
+def _title_score(query: str, title: str) -> float:
+    """标题与查询的相似度：完全相同 > 包含 > 滑窗部分匹配。"""
+    if not title:
+        return 0.0
+    if query == title:
+        return 1.0
+    if title in query:
+        return 0.95
+    if query in title and len(query) >= 3:
+        return 0.9
+    return _partial_ratio(query, title) * 0.95
+
+
+def _find_by_fragment(fragment: str, songs: list[Path]) -> Path | None:
+    needle = _normalize(fragment)
+    if not needle:
+        return None
+    for song in songs:
+        if needle in _normalize(_title_of(song)):
+            return song
+    return None
+
+
+def _match_song(
+    request: str,
+    songs: list[Path],
+    aliases: dict[str, str] | None = None,
+) -> tuple[Path, float] | None:
     """在曲库里找最匹配的一首，返回 (歌曲, 置信度)；不够像就返回 None。"""
     query = _normalize(request)
     if not query:
@@ -116,19 +160,24 @@ def _match_song(request: str, songs: list[Path]) -> tuple[Path, float] | None:
     best_song: Path | None = None
     best_score = 0.0
     for song in songs:
-        title = _normalize(_title_of(song))
-        if not title:
-            continue
-        if query == title:
-            score = 1.0
-        elif title in query:
-            score = 0.95
-        elif query in title and len(query) >= 3:
-            score = 0.9
-        else:
-            score = _partial_ratio(query, title) * 0.95
+        score = _title_score(query, _normalize(_title_of(song)))
         if score > best_score:
             best_song, best_score = song, score
+    for alias, fragment in (aliases or {}).items():
+        name = _normalize(alias)
+        if not name:
+            continue
+        if query == name:
+            score = 0.98
+        elif name in query and len(name) >= 2:
+            score = 0.96
+        else:
+            score = _partial_ratio(query, name) * 0.92
+        if score <= best_score:
+            continue
+        target = _find_by_fragment(fragment, songs)
+        if target is not None:
+            best_song, best_score = target, score
     if best_song is not None and best_score >= 0.72:
         return best_song, best_score
     return None
@@ -176,7 +225,7 @@ class LunaSingPlugin(Star):
             120.0,
         )
         self.miss_reply = str(config.get("miss_reply", "") or "").strip()
-        self.list_on_miss = self._as_bool(config.get("list_songs_on_miss", True))
+        self.aliases = self._build_aliases(config.get("song_aliases", {}))
 
         root = Path(__file__).resolve().parent
         self._songs_dir = root / "songs"
@@ -236,26 +285,22 @@ class LunaSingPlugin(Star):
     def _available_titles(self, songs: list[Path]) -> str:
         return "、".join(_title_of(song) for song in songs)
 
+    @staticmethod
+    def _build_aliases(configured) -> dict[str, str]:
+        """内置中文叫法 + 配置里的追加项；配置项优先。"""
+        aliases = dict(_BUILTIN_ALIASES)
+        if isinstance(configured, dict):
+            aliases.update(
+                {str(key): str(value) for key, value in configured.items() if key and value}
+            )
+        return aliases
+
     def _miss_message(self, request: str, songs: list[Path]) -> str:
         title = request or "这首"
-        catalog = self._available_titles(songs)
         if self.miss_reply:
-            text = self.miss_reply.replace("{title}", title).replace("{songs}", catalog)
-            if "{songs}" in self.miss_reply:
-                return text
-        else:
-            text = random.choice(_MISS_LINES).replace("{title}", title)
-        if self.list_on_miss and catalog:
-            text = f"{text}\n{random.choice(self._catalog_prefixes())}{catalog}。"
-        return text
-
-    @staticmethod
-    def _catalog_prefixes() -> tuple[str, ...]:
-        return (
-            "现在曲库里只有：",
-            "手头这些，自己挑：",
-            "曲库就这些：",
-        )
+            catalog = self._available_titles(songs)
+            return self.miss_reply.replace("{title}", title).replace("{songs}", catalog)
+        return random.choice(_MISS_LINES).replace("{title}", title)
 
     async def _safe_send(self, event: AstrMessageEvent, text: str) -> None:
         try:
@@ -385,7 +430,9 @@ class LunaSingPlugin(Star):
             songs = self._songs()
             requested = _requested_title(text) if text else ""
             if requested:
-                matched = _match_song(requested, songs) or _match_song(text, songs)
+                matched = _match_song(requested, songs, self.aliases) or _match_song(
+                    text, songs, self.aliases
+                )
                 if matched is None:
                     yield event.plain_result(self._miss_message(requested, songs))
                     return
@@ -453,7 +500,11 @@ class LunaSingPlugin(Star):
         # 要么是“想听歌”这类泛请求，要么直接报了一首曲库里的歌名
         requested = _requested_title(text)
         try:
-            matched = _match_song(requested, self._songs()) if requested else None
+            matched = (
+                _match_song(requested, self._songs(), self.aliases)
+                if requested
+                else None
+            )
         except SingError:
             return
         if requested and matched is None and _CHATTY_RE.search(requested):
