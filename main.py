@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import os
 import random
 import re
+import subprocess
+import sys
 import time
 import unicodedata
 from collections.abc import AsyncIterator
@@ -61,6 +64,9 @@ _GENERIC_RE = re.compile(
 # 剥出来的“歌名”里带这些字，多半是在聊天而不是点歌
 _CHATTY_RE = re.compile(r"(?:说|话|聊|讲|告诉|看看|睡|吃|玩|做|陪|夸|骂|叫)")
 _PUNCT_RE = re.compile(r"[\s\u3000!-/:-@\[-`{-~。、，．·…〜~！？「」『』【】（）()《》〈〉「」『』—–_]+")
+
+# 看板上的快捷入口：GET /api/plug/astrbot_plugin_luna_sing/open-songs
+_OPEN_FOLDER_ROUTE = "/astrbot_plugin_luna_sing/open-songs"
 
 # 点不到歌时的回应（{title} 是用户点的名字）
 _MISS_LINES = (
@@ -228,7 +234,14 @@ class LunaSingPlugin(Star):
         self.aliases = self._build_aliases(config.get("song_aliases", {}))
 
         root = Path(__file__).resolve().parent
-        self._songs_dir = root / "songs"
+        configured_dir = str(config.get("songs_dir", "") or "").strip()
+        if configured_dir:
+            songs_dir = Path(configured_dir).expanduser()
+            if not songs_dir.is_absolute():
+                songs_dir = root / songs_dir
+        else:
+            songs_dir = root / "songs"
+        self._songs_dir = songs_dir
         self._cache_dir = root / "cache"
         self._songs_dir.mkdir(parents=True, exist_ok=True)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -238,6 +251,45 @@ class LunaSingPlugin(Star):
         self._ffmpeg = self._find_ffmpeg()
         if not self._ffmpeg:
             logger.warning("[LunaSing] 未找到 ffmpeg，无法把 WAV 转成 MP3")
+        self._register_open_folder_api()
+
+    def _register_open_folder_api(self) -> None:
+        """注册看板接口：在服务器所在机器上打开曲库目录。"""
+        try:
+            self.context.register_web_api(
+                _OPEN_FOLDER_ROUTE,
+                self._open_songs_folder,
+                ["GET"],
+                "打开 Luna 唱歌的曲库文件夹",
+            )
+        except Exception as exc:  # noqa: BLE001 - 老版本 AstrBot 没有这个接口
+            logger.warning("[LunaSing] 注册「打开曲库目录」接口失败: %s", exc)
+
+    async def _open_songs_folder(self, **_: object) -> dict:
+        """在资源管理器里打开曲库目录（看板配置页的快捷入口）。"""
+        path = self._songs_dir
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                # 直接起 explorer 比 ShellExecute 更宽松：实例以低完整性运行，
+                # os.startfile 会被拒绝（WinError 5），CreateProcess 一般没问题。
+                subprocess.Popen(["explorer.exe", str(path)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:  # noqa: BLE001 - 返回错误给看板
+            logger.warning("[LunaSing] 打开曲库目录失败: %s", exc)
+            return {
+                "status": "error",
+                "message": f"打开失败：{exc}",
+                "data": {"path": str(path)},
+            }
+        return {
+            "status": "ok",
+            "message": f"已打开：{path}",
+            "data": {"path": str(path)},
+        }
 
     @staticmethod
     def _as_bool(value) -> bool:
